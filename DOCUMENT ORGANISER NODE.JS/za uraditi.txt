@@ -1,0 +1,5 @@
+testiraj logiku za PDF year getter
+napravi i testiraj logiku za XML year getter (based on file type)
+automatski napravi XML folder ko PDF i tamo ubacuj .xml fajlove
+napravi da ubacuje fajlove po godinama i na PC i u GOOGLE DRIVE (IZVODI -> GODINA -> XML || PDF)
+SECURITY SECURITY SECURITY

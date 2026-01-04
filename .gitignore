@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+*.toc
+*.pyz
+*.pkg
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+node_modules
+DOCUMENT ORGANISER NODE.JS/auth/credentials.json
+DOCUMENT ORGANISER NODE.JS/auth/token.json
+DOCUMENT ORGANISER NODE.JS/folder_cache.json
