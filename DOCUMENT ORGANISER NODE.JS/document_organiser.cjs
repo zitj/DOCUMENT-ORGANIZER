@@ -228,7 +228,7 @@ async function driveFileExists(drive, folderId, fileName) {
 async function uploadFile(fileDetails, fullPath, auth) {
     const drive = google.drive({ version: "v3", auth });
     const { fileName, type, date, extension } = fileDetails;
-    const TARGET_PATH = `TEST/${date.year}/${type}/${extension}`;
+    const TARGET_PATH = `TEST/${date.year}/${type.toUpperCase()}/${extension.toUpperCase()}`;
 
     console.log(`Resolving path: ${TARGET_PATH}`);
     const folderId = await ensureDrivePath(drive, TARGET_PATH);
