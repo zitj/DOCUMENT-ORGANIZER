@@ -6,22 +6,6 @@ const fsp = fs.promises;
 const { google } = require("googleapis");
 const { getDateFromPDF } = require("./pdf_year_getter.js");
 const { getDateFromXML } = require("./xml_year_getter.js");
-// const monthMapper = {
-//   '01': 'januar',
-//   '02': 'februar',
-//   '03': 'mart',
-//   '04': 'april',
-//   '05': 'maj',
-//   '06': 'jun',
-//   '07': 'jul',
-//   '08': 'avgust',
-//   '09': 'septembar',
-//   '10': 'oktobar',
-//   '11': 'novembar',
-//   '12': 'decembar',
-// };
-// Map<"TEST/2025/DEVIZNI/pdf", "google-folder-id">
-const pathFolderCache = {};
 
 // Load cache from disk (path -> folderId)
 function loadCache() {
@@ -40,6 +24,82 @@ function saveCache(cache) {
     fs.writeFileSync(CACHE_PATH, JSON.stringify(cache, null, 2), "utf8");
 }
 
+let memoryFolderCache = loadCache();
+const pendingFolderCreates = new Map();
+
+function getCache() {
+    return memoryFolderCache;
+}
+
+function updateCache(updates) {
+    memoryFolderCache = { ...memoryFolderCache, ...updates };
+    saveCache(memoryFolderCache);
+}
+
+function deleteCacheKey(key) {
+    if (memoryFolderCache[key]) {
+        delete memoryFolderCache[key];
+        saveCache(memoryFolderCache);
+    }
+}
+
+async function seedRootFolderCache(drive, rootName) {
+    const cache = getCache();
+    const cacheKey = `root:${rootName}`;
+    if (cache[cacheKey]) return;
+
+    const res = await drive.files.list({
+        q: [
+            "mimeType = 'application/vnd.google-apps.folder'",
+            "trashed = false",
+            `name = '${rootName.replace(/'/g, "\\'")}'`,
+        ].join(" and "),
+        fields: "files(id, name, parents, driveId)",
+        includeItemsFromAllDrives: true,
+        supportsAllDrives: true,
+        corpora: "allDrives",
+        pageSize: 5,
+    });
+
+    const files = res.data.files || [];
+    if (files.length > 0) {
+        updateCache({ [cacheKey]: files[0].id });
+        if (files.length > 1) {
+            console.log(
+                `Found ${files.length} folders named ${rootName}; using ${files[0].id}`,
+            );
+        }
+    }
+}
+
+async function cleanFolderCache(drive) {
+    const cache = getCache();
+    let changed = false;
+
+    for (const [key, folderId] of Object.entries(cache)) {
+        try {
+            const meta = await drive.files.get({
+                fileId: folderId,
+                fields: "id, trashed",
+                supportsAllDrives: true,
+            });
+            if (meta.data.trashed) {
+                delete cache[key];
+                changed = true;
+            }
+        } catch {
+            delete cache[key];
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        memoryFolderCache = cache;
+        saveCache(cache);
+        console.log("Cleaned folder cache (removed trashed/missing ids).");
+    }
+}
+
 /**
  * Get or create a unique Drive folder *by name* without reading from Drive.
  * - Uses only drive.files.create (write operation).
@@ -48,35 +108,74 @@ function saveCache(cache) {
 async function getOrCreateSingleFolder(
     drive,
     folderName,
-    parentId = undefined
+    parentId = undefined,
 ) {
-    const cache = loadCache();
-    const cacheKey = parentId ? `${parentId}:${folderName}` : folderName;
+    const cache = getCache();
+    const effectiveParentId = parentId ?? "root";
+    const cacheKey = `${effectiveParentId}:${folderName}`;
 
     // 1. If we already created it in a previous run, just reuse it
     if (cache[cacheKey]) {
-        return cache[cacheKey]; // folderId
+        try {
+            const cachedId = cache[cacheKey];
+            const meta = await drive.files.get({
+                fileId: cachedId,
+                fields: "id, name, trashed",
+                supportsAllDrives: true,
+            });
+            if (!meta.data.trashed) {
+                return cachedId; // folderId
+            }
+            // Cached folder is trashed, drop cache and continue
+            deleteCacheKey(cacheKey);
+        } catch {
+            // Cached folder missing or inaccessible, drop cache and continue
+            deleteCacheKey(cacheKey);
+        }
     }
 
-    // 2. Otherwise create a new folder on Drive
-    const fileMetadata = {
-        name: folderName,
-        mimeType: "application/vnd.google-apps.folder",
-        ...(parentId ? { parents: [parentId] } : {}),
-    };
+    if (pendingFolderCreates.has(cacheKey)) {
+        return pendingFolderCreates.get(cacheKey);
+    }
 
-    const res = await drive.files.create({
-        resource: fileMetadata,
-        fields: "id, name",
-    });
+    const createPromise = (async () => {
+        // 2. Check Drive for an existing folder under the parent
+        const existing = await findFolderByName(
+            drive,
+            effectiveParentId,
+            folderName,
+        );
+        if (existing) {
+            updateCache({ [cacheKey]: existing.id });
+            return existing.id;
+        }
 
-    const folderId = res.data.id;
+        // 3. Otherwise create a new folder on Drive
+        const fileMetadata = {
+            name: folderName,
+            mimeType: "application/vnd.google-apps.folder",
+            parents: [effectiveParentId],
+        };
 
-    // 3. Store in local cache so we don’t create another one with the same key
-    cache[cacheKey] = folderId;
-    saveCache(cache);
+        const res = await drive.files.create({
+            resource: fileMetadata,
+            fields: "id, name",
+        });
 
-    return folderId;
+        const folderId = res.data.id;
+
+        // 4. Store in local cache so we don't create another one with the same key
+        updateCache({ [cacheKey]: folderId });
+
+        return folderId;
+    })();
+
+    pendingFolderCreates.set(cacheKey, createPromise);
+    try {
+        return await createPromise;
+    } finally {
+        pendingFolderCreates.delete(cacheKey);
+    }
 }
 
 async function ensureDrivePath(drive, targetPath) {
@@ -111,50 +210,6 @@ async function findFolderByName(drive, parentId, name) {
     return files[0] || null; // if multiple, just take first
 }
 
-// Create a folder with given name under given parent
-// async function createFolder(drive, parentId, name) {
-//   const res = await drive.files.create({
-//     requestBody: {
-//       name,
-//       mimeType: 'application/vnd.google-apps.folder',
-//       parents: [parentId],
-//     },
-//     fields: 'id, name',
-//   });
-
-//   console.log(`Created folder: ${name} (id: ${res.data.id})`);
-//   return res.data;
-// }
-
-async function ensurePath(drive, path) {
-    const segments = path
-        .split("/")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
-
-    let currentParentId = "root"; // start from My Drive root
-
-    for (const segment of segments) {
-        // For simplicity we assume no apostrophes in names (TEST, 2025, FILES, TXT are fine)
-        const existing = await findFolderByName(
-            drive,
-            currentParentId,
-            segment
-        );
-        if (existing) {
-            // Folder exists, go inside
-            console.log(`Found folder: ${segment} (id: ${existing.id})`);
-            currentParentId = existing.id;
-        } else {
-            // Folder doesn't exist, create it
-            const created = await createFolder(drive, currentParentId, segment);
-            currentParentId = created.id;
-        }
-    }
-
-    return currentParentId;
-}
-
 async function driveFileExists(drive, folderId, fileName) {
     const res = await drive.files.list({
         q: [
@@ -170,77 +225,6 @@ async function driveFileExists(drive, folderId, fileName) {
     const files = res.data.files || [];
     return files.length > 0;
 }
-
-async function createNestedFolders(drive, fullPath, parentId = null) {
-    const parts = fullPath.split("/").filter(Boolean);
-    let currentParent = parentId;
-
-    for (const name of parts) {
-        currentParent = await ensureOrCreateFolder(drive, name, currentParent);
-    }
-
-    return currentParent; // final folder id
-}
-
-async function ensureOrCreateFolder(drive, name, parentId) {
-    const escapedName = name.replace(/'/g, "\\'");
-    const q = [
-        "mimeType = 'application/vnd.google-apps.folder'",
-        "trashed = false",
-        `name = '${escapedName}'`,
-    ];
-
-    if (parentId) {
-        q.push(`'${parentId}' in parents`);
-    }
-
-    // 1️⃣ Search for folder
-    const res = await drive.files.list({
-        q: q.join(" and "),
-        fields: "files(id, name)",
-        spaces: "drive",
-        pageSize: 1,
-    });
-
-    if (res.data.files?.length > 0) {
-        return res.data.files[0].id; // folder already exists
-    }
-
-    // 2️⃣ Create folder
-    const metadata = {
-        name,
-        mimeType: "application/vnd.google-apps.folder",
-        ...(parentId ? { parents: [parentId] } : {}),
-    };
-
-    const newFolder = await drive.files.create({
-        resource: metadata,
-        fields: "id",
-    });
-
-    return newFolder.data.id;
-}
-
-async function checkDriveFolderWithName(drive, folderName) {
-    const q = [
-        "mimeType = 'application/vnd.google-apps.folder'",
-        "trashed = false",
-        `name = '${folderName.replace(/'/g, "\\'")}'`,
-    ].join(" and ");
-
-    const res = await drive.files.list({
-        q,
-        fields: "files(id, name, parents, driveId)",
-        includeItemsFromAllDrives: true,
-        supportsAllDrives: true,
-        corpora: "allDrives", // My Drive + all Shared Drives
-    });
-
-    console.log("Query:", q);
-    console.log("Found folders:", res.data.files);
-
-    return res.data.files[0] ?? null;
-}
 async function uploadFile(fileDetails, fullPath, auth) {
     const drive = google.drive({ version: "v3", auth });
     const { fileName, type, date, extension } = fileDetails;
@@ -253,11 +237,11 @@ async function uploadFile(fileDetails, fullPath, auth) {
     const fileAlreadyExistsInDrive = await driveFileExists(
         drive,
         folderId,
-        fileName
+        fileName,
     );
     if (fileAlreadyExistsInDrive) {
         console.log(
-            `⚠️ File already exists on Drive, skipping upload: ${fileName}`
+            `⚠️ File already exists on Drive, skipping upload: ${fileName}`,
         );
         return;
     }
@@ -289,31 +273,11 @@ async function uploadFile(fileDetails, fullPath, auth) {
 // Directory paths
 const sourceDir = "C:/PERSONAL/4SOLUTIONS IZVODI";
 
-async function debugListSomeFolders(drive) {
-    const res = await drive.files.list({
-        q: "mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-        pageSize: 10,
-        fields: "files(id, name)",
-        spaces: "drive",
-    });
-
-    console.log("Visible folders for this credential:", res.data.files);
-}
-
-async function createTestFolder(auth) {
-    const drive = google.drive({ version: "v3", auth });
-
-    await drive.files.create({
-        requestBody: {
-            name: "TEST",
-            mimeType: "application/vnd.google-apps.folder",
-        },
-    });
-}
-
 async function moveStoreAndUploadFiles(auth) {
     // Get the downloads folder path based on the OS
     const drive = google.drive({ version: "v3", auth });
+    await cleanFolderCache(drive);
+    await seedRootFolderCache(drive, "TEST");
     const downloadsDir = path.join(os.homedir(), "Downloads");
     // Ensure destination directory exists
     if (!fs.existsSync(sourceDir)) {
@@ -342,7 +306,7 @@ async function moveStoreAndUploadFiles(auth) {
             sourceDir,
             date.year,
             type.toUpperCase(),
-            extension
+            extension,
         );
 
         if (!fs.existsSync(destinationDirectory)) {
@@ -355,7 +319,7 @@ async function moveStoreAndUploadFiles(auth) {
             try {
                 const destinationPath = path.join(
                     destinationDirectory,
-                    fileName
+                    fileName,
                 );
 
                 // Copy the file to destination then delete the original
@@ -378,32 +342,6 @@ async function moveStoreAndUploadFiles(auth) {
     console.log(`Operation completed. ${moveCount} files moved successfully!`);
 }
 
-// Create all necessary directories if they don't exist
-// function createDirectories() {
-//     [dinarskiDir, devizniDir, dinarskiPdfDir, devizniPdfDir].forEach((dir) => {
-//         if (!fs.existsSync(dir)) {
-//             fs.mkdirSync(dir, { recursive: true });
-//             console.log(`Created directory: ${dir}`);
-//         }
-//     });
-// }
-
-// Function to check if file already exists in target directory
-function isDuplicate(targetDir, newFileName) {
-    return fs.existsSync(path.join(targetDir, newFileName));
-}
-
-// Function to delete file
-function deleteFile(filePath) {
-    try {
-        fs.unlinkSync(filePath);
-        console.log(`Deleted: ${path.basename(filePath)}`);
-    } catch (error) {
-        console.error(`Error deleting file ${filePath}:`, error.message);
-    }
-}
-
-// Function to get new filename based on rules
 async function getNewFileDetails(oldFileName, sourcePath) {
     // Extract the "Izvod br. X" part using regex
     const match = oldFileName.match(/Izvod br\. \d+/);
@@ -427,121 +365,6 @@ async function getNewFileDetails(oldFileName, sourcePath) {
         date,
     };
 }
-
-// Function to determine target directory based on file type and extension
-// function getTargetDirectory(fileType, extension) {
-//     if (fileType === 'dinarski') {
-//         return extension === '.pdf' ? dinarskiPdfDir : dinarskiDir;
-//     } else {
-//         return extension === '.pdf' ? devizniPdfDir : devizniDir;
-//     }
-// }
-
-// async function organizeFiles(auth) {
-//   try {
-//     // Check if source directory exists
-//     if (!fs.existsSync(sourceDir)) {
-//       console.error('Source directory does not exist:', sourceDir);
-//       return;
-//     }
-
-//     // Create destination directories
-//     // createDirectories();
-
-//     // Move all the files from downloads to the sourceDir
-//     // moveFilesFromDownloads();
-
-//     // Read all files in the directory
-//     const files = fs.readdirSync(sourceDir);
-
-//     if (files.length === 0) {
-//       console.log('No files found in directory');
-//       return;
-//     }
-
-//     // Track statistics
-//     const stats = {
-//       processed: 0,
-//       deleted: 0,
-//       skipped: 0,
-//       duplicates: 0,
-//     };
-
-//     // Build an array of async tasks
-//     const tasks = files.map(async (file) => {
-//       const oldPath = path.join(sourceDir, file);
-
-//       // Skip if it's a directory
-//       if (fs.statSync(oldPath).isDirectory()) return;
-
-//       // Skip if file is not PDF or XML
-//       const extension = path.extname(file).toLowerCase();
-//       if (extension !== '.pdf' && extension !== '.xml') {
-//         deleteFile(oldPath);
-//         stats.deleted++;
-//         return;
-//       }
-
-//       // Get new filename
-//       const newFileInfo = getNewFileName(file);
-
-//       if (newFileInfo) {
-//         // Determine target directory based on file type and extension
-//         const targetDir = getTargetDirectory(newFileInfo.type, extension);
-
-//         // Check for duplicates
-//         if (isDuplicate(targetDir, newFileInfo.newName)) {
-//           console.log(`Duplicate found, skipping: ${file}`);
-//           deleteFile(oldPath);
-//           stats.duplicates++;
-//           return;
-//         }
-
-//         // Move and rename file
-//         const newPath = path.join(targetDir, newFileInfo.newName);
-//         fs.renameSync(oldPath, newPath);
-
-//         const locationStr = `${newFileInfo.type === 'dinarski' ? 'Dinarski' : 'Devizni'}${
-//           extension === '.pdf' ? '/PDF' : ''
-//         } folder`;
-
-//         console.log(`Moved and renamed: ${file} -> ${newFileInfo.newName}`);
-//         console.log(`Location: ${locationStr}`);
-
-//         if (auth) {
-//           await uploadFile(newFileInfo, newPath, auth);
-//         }
-
-//         stats.processed++;
-//       } else {
-//         // Delete files that don't match the "Izvod br." pattern
-//         deleteFile(oldPath);
-//         stats.deleted++;
-//       }
-//     });
-
-//     // ✅ Wait for ALL file tasks to finish
-//     await Promise.all(tasks);
-
-//     // ✅ Now it's safe to print summary
-//     console.log('\nOperation Summary:');
-//     //add stats.uploaded
-//     console.log(`Files processed: ${stats.processed}`);
-//     console.log(`Files deleted: ${stats.deleted}`);
-//     console.log(`Duplicates found: ${stats.duplicates}`);
-//     console.log(`Total files handled: ${stats.processed + stats.deleted + stats.duplicates}`);
-
-//     console.log('\nDirectory structure:');
-//     console.log('Dinarski/');
-//     console.log('  ├── PDF/    (PDF files)');
-//     console.log('  └── ...     (XML files)');
-//     console.log('Devizni/');
-//     console.log('  ├── PDF/    (PDF files)');
-//     console.log('  └── ...     (XML files)');
-//   } catch (error) {
-//     console.error('Error:', error.message);
-//   }
-// }
 
 // Run the script
 authorize()
